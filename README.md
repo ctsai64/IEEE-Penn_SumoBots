@@ -1,6 +1,4 @@
 # SumoBot – Arduino Program README
-### IEEE Spring 2024 Joint R2 & R1 SAC | Organizer: Jenna Fazio
-
 ---
 
 ## Overview
