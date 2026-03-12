@@ -1,0 +1,407 @@
+#include <Wire.h>
+#include <Zumo32U4.h>
+
+Zumo32U4OLED display;
+Zumo32U4ButtonA buttonA;
+Zumo32U4Buzzer buzzer;
+Zumo32U4Motors motors;
+Zumo32U4LineSensors lineSensors;
+Zumo32U4ProximitySensors proxSensors;
+Zumo32U4IMU imu;
+
+const int waitTime = 5200;
+const int openingTurnTime = 260;
+const int fastTurnSpeed = 350;
+const int forwardSpeed = 300;
+const int rammingSpeed = 400;
+const int reverseSpeed = -350;
+
+int lineValues[3];
+int32_t gyroOffsetZ = 0;
+
+int currentTest = 1;
+
+void waitForButton()
+{
+  display.gotoXY(0, 1);
+  display.print(F("A=next      "));
+  while (!buttonA.getSingleDebouncedPress()) {}
+}
+
+void showHeader(const char* name)
+{
+  motors.setSpeeds(0,0);
+  ledRed(0); 
+  ledYellow(0); 
+  ledGreen(0);
+
+  display.clear();
+  display.print(name);
+  delay(600);
+}
+
+// ---------------- BATTERY ----------------
+
+void test_battery()
+{
+  showHeader("Batt");
+
+  uint16_t mv = readBatteryMillivolts();
+
+  display.clear();
+  display.print(mv);
+  display.print(F("mV"));
+
+  waitForButton();
+}
+
+// ---------------- GYRO CALIBRATION ----------------
+
+void test_gyro()
+{
+  showHeader("Gyro");
+
+  display.clear();
+  display.print(F("Gyro cal"));
+  display.gotoXY(0,1);
+  display.print(F("Hold still"));
+
+  int32_t total = 0;
+
+  for(int i=0;i<100;i++)
+  {
+    imu.read();
+    total += imu.g.z;
+    delay(10);
+  }
+
+  gyroOffsetZ = total / 100;
+
+  display.clear();
+  display.print(F("Offset:"));
+  display.gotoXY(0,1);
+  display.print(gyroOffsetZ);
+  delay(1000);
+
+  display.clear();
+  display.print(F("Drift chk"));
+
+  int32_t maxDrift = 0;
+  uint32_t start = millis();
+
+  while(millis() - start < 3000)
+  {
+    imu.read();
+
+    int32_t drift = abs(imu.g.z - gyroOffsetZ);
+
+    if(drift > maxDrift) maxDrift = drift;
+
+    display.gotoXY(0,1);
+    display.print(F("d="));
+    display.print(drift);
+    display.print(F("   "));
+
+    delay(50);
+  }
+
+  display.clear();
+  display.print(F("MaxDrift"));
+  display.gotoXY(0,1);
+  display.print(maxDrift);
+
+  delay(1000);
+  waitForButton();
+}
+
+// ---------------- LINE SENSORS ----------------
+
+void test_lineSensorsRaw()
+{
+  showHeader("LineSens");
+
+  display.clear();
+  display.print(F("Watch vals"));
+  delay(800);
+
+  while(!buttonA.getSingleDebouncedPress())
+  {
+    lineSensors.read(lineValues);
+
+    display.clear();
+
+    display.print(F("L"));
+    display.print(lineValues[0]);
+    display.print(F(" C"));
+    display.print(lineValues[1]);
+
+    display.gotoXY(0,1);
+    display.print(F("R"));
+    display.print(lineValues[2]);
+
+    delay(100);
+  }
+}
+
+// ---------------- PROX SENSORS ----------------
+
+void test_proxSensors()
+{
+  showHeader("Prox");
+
+  delay(800);
+
+  while(!buttonA.getSingleDebouncedPress())
+  {
+    proxSensors.read();
+
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+    int sL = proxSensors.countsLeftWithLeftLeds();
+    int sR = proxSensors.countsRightWithRightLeds();
+
+    display.clear();
+
+    display.print(F("F:"));
+    display.print(fL);
+    display.print(F("/"));
+    display.print(fR);
+
+    display.gotoXY(0,1);
+    display.print(F("S:"));
+    display.print(sL);
+    display.print(F("/"));
+    display.print(sR);
+
+    delay(100);
+  }
+
+  waitForButton();
+}
+
+// ---------------- MOTORS ----------------
+
+void test_motors()
+{
+  showHeader("Motors");
+
+  display.clear();
+  display.print(F("Clear space"));
+  display.gotoXY(0,1);
+  display.print(F("A=run"));
+
+  waitForButton();
+
+  display.clear();
+  display.print(F("Forward"));
+  motors.setSpeeds(forwardSpeed, forwardSpeed);
+  delay(500);
+
+  motors.setSpeeds(0,0);
+  delay(300);
+
+  display.clear();
+  display.print(F("Reverse"));
+  motors.setSpeeds(reverseSpeed, reverseSpeed);
+  delay(500);
+
+  motors.setSpeeds(0,0);
+  delay(300);
+
+  display.clear();
+  display.print(F("Spin L"));
+  motors.setSpeeds(-fastTurnSpeed, fastTurnSpeed);
+  delay(400);
+
+  motors.setSpeeds(0,0);
+  delay(300);
+
+  display.clear();
+  display.print(F("Spin R"));
+  motors.setSpeeds(fastTurnSpeed, -fastTurnSpeed);
+  delay(400);
+
+  motors.setSpeeds(0,0);
+  delay(300);
+
+  display.clear();
+  display.print(F("RAM"));
+  motors.setSpeeds(rammingSpeed, rammingSpeed);
+  delay(400);
+
+  motors.setSpeeds(0,0);
+
+  waitForButton();
+}
+
+// ---------------- TURN TEST ----------------
+
+void test_openingTurn()
+{
+  showHeader("TurnAngl");
+
+  display.clear();
+  display.print(F("Clear space"));
+  display.gotoXY(0,1);
+  display.print(F("A=run"));
+
+  waitForButton();
+
+  for(int dir = 1; dir >= -1; dir -= 2)
+  {
+    display.clear();
+    display.print(dir==1 ? F("Turn R") : F("Turn L"));
+
+    motors.setSpeeds(dir*fastTurnSpeed, -dir*fastTurnSpeed);
+    delay(openingTurnTime);
+
+    motors.setSpeeds(0,0);
+
+    waitForButton();
+  }
+}
+
+// ---------------- GYRO LIVE ----------------
+
+void test_gyroPushResist()
+{
+  showHeader("GyroLive");
+
+  display.clear();
+  display.print(F("Spin bot"));
+
+  while(!buttonA.getSingleDebouncedPress())
+  {
+    imu.read();
+
+    int32_t gyroZ = imu.g.z - gyroOffsetZ;
+
+    display.clear();
+    display.print(F("Z:"));
+    display.print(gyroZ);
+
+    delay(100);
+  }
+
+  waitForButton();
+}
+
+// ---------------- FULL SEQUENCE ----------------
+
+void test_fullSequence()
+{
+  showHeader("FullSeq");
+
+  display.clear();
+  display.print(F("Clear space"));
+  display.gotoXY(0,1);
+  display.print(F("A=run"));
+
+  waitForButton();
+
+  display.clear();
+  display.print(F("WAIT"));
+  motors.setSpeeds(0,0);
+  delay(1000);
+
+  display.clear();
+  display.print(F("TURN"));
+  ledGreen(1);
+  motors.setSpeeds(fastTurnSpeed,-fastTurnSpeed);
+  delay(openingTurnTime);
+
+  motors.setSpeeds(0,0);
+  ledGreen(0);
+
+  display.clear();
+  display.print(F("LUNGE"));
+  ledRed(1);
+  motors.setSpeeds(rammingSpeed,rammingSpeed);
+  delay(400);
+
+  motors.setSpeeds(0,0);
+  ledRed(0);
+
+  display.clear();
+  display.print(F("SCAN"));
+  motors.setSpeeds(200,-200);
+  delay(1500);
+
+  motors.setSpeeds(0,0);
+
+  display.clear();
+  display.print(F("BORDER"));
+  ledYellow(1);
+
+  motors.setSpeeds(reverseSpeed,reverseSpeed);
+  delay(200);
+
+  motors.setSpeeds(fastTurnSpeed,-fastTurnSpeed);
+  delay(150);
+
+  motors.setSpeeds(0,0);
+  ledYellow(0);
+
+  waitForButton();
+}
+
+// ---------------- SETUP ----------------
+
+void setup()
+{
+  lineSensors.initThreeSensors();
+  proxSensors.initThreeSensors();
+
+  Wire.begin();
+
+  imu.init();
+  imu.enableDefault();
+
+  display.clear();
+  display.print(F("DIAGNOS"));
+  display.gotoXY(0,1);
+  display.print(F("A=start"));
+
+  while(!buttonA.getSingleDebouncedPress()) {}
+}
+
+// ---------------- LOOP ----------------
+
+void loop()
+{
+  display.clear();
+  display.print(currentTest);
+  display.print(F(" A=run"));
+
+  waitForButton();
+
+  switch(currentTest)
+  {
+    case 1: test_battery(); break;
+    case 2: test_gyro(); break;
+    case 3: test_lineSensorsRaw(); break;
+    case 4: test_proxSensors(); break;
+    case 5: test_motors(); break;
+    case 6: test_openingTurn(); break;
+    case 7: test_gyroPushResist(); break;
+    case 8: test_fullSequence(); break;
+  }
+
+  currentTest++;
+
+  if(currentTest > 8)
+  {
+    display.clear();
+    display.print(F("ALL DONE"));
+
+    ledGreen(1);
+
+    buzzer.playNote(NOTE_C(6),200,15);
+    delay(100);
+    buzzer.playNote(NOTE_E(6),200,15);
+    delay(100);
+    buzzer.playNote(NOTE_G(6),400,15);
+
+    while(true){}
+  }
+}
