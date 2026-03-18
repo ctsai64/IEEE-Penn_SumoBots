@@ -1,0 +1,725 @@
+// =============================================================================
+//  SumoBot Competition Code  –  Optimized Strategy
+//  Target: Pololu Zumo 32U4  |  IEEE SAC Spring 2024
+//
+//  Strategy overview
+//  ─────────────────
+//  BORDER SAFETY   – Checked every loop iteration; overrides everything.
+//                    Multi-level escape: hard reverse → escape turn → re-scan.
+//                    Center-bias nudge during Scanning keeps bot near the
+//                    middle of the Dohyo.
+//
+//  SEARCH          – Adaptive scan: starts toward the side where the opponent
+//                    was last seen, widens sweep angle each cycle.
+//                    Uses a short forward creep between turns to cover area.
+//
+//  ATTACK          – Three-phase: Align → Close → Ram.
+//                    Alignment uses proportional steering from front prox
+//                    sensors.  Once both front sensors are high the bot
+//                    enters full-power Ramming and locks on with the gyro
+//                    to resist being pushed sideways.
+//
+//  DEFENSE         – Gyro resistance in Driving and Ramming states.
+//                    Border escape uses a deliberate reverse + pivot; the
+//                    pivot direction is chosen to face back toward centre.
+// =============================================================================
+
+#include <Wire.h>
+#include <Zumo32U4.h>
+
+// ---------------------------------------------------------------------------
+//  Hardware
+// ---------------------------------------------------------------------------
+Zumo32U4OLED             display;
+Zumo32U4ButtonA          buttonA;
+Zumo32U4Buzzer           buzzer;
+Zumo32U4Motors           motors;
+Zumo32U4LineSensors      lineSensors;
+Zumo32U4ProximitySensors proxSensors;
+Zumo32U4IMU              imu;
+
+// ---------------------------------------------------------------------------
+//  Speed constants  (all PWM values, range –400 … +400)
+// ---------------------------------------------------------------------------
+const int SPEED_REVERSE      = -200;  // escape reverse (original value)
+const int SPEED_TURN_SLOW    =  100;  // scan sweep (original slow turn speed)
+const int SPEED_TURN_FAST    =  350;  // opening turn / escape pivot (original)
+const int SPEED_FORWARD      =  300;  // approach (original)
+const int SPEED_RAMMING      =  400;  // full-power push (maximum)
+const int SPEED_CREEP        =  150;  // slow forward creep during scan
+
+// ---------------------------------------------------------------------------
+//  Timing constants  (milliseconds)
+// ---------------------------------------------------------------------------
+const uint32_t WAIT_TIME          = 5200;  // 5-second rule buffer
+const uint32_t REVERSE_TIME       =  100;  // how long to reverse on border hit (original)
+const uint32_t ESCAPE_TURN_TIME   =  220;  // escape pivot — slightly longer to face more inward
+const uint32_t RAMMING_TIMEOUT    = 1500;  // give up ram if no contact this long (original)
+const uint32_t OPENING_TURN_TIME  =  260;  // initial orientation turn (original)
+const uint32_t OPENING_LUNGE_TIME =  600;  // initial charge duration (original)
+const uint32_t SCAN_CREEP_TIME    =  300;  // forward creep between scan sweeps
+const uint32_t ALIGN_TIMEOUT      =  400;  // max time to spend aligning
+
+// ---------------------------------------------------------------------------
+//  Proximity thresholds
+// ---------------------------------------------------------------------------
+const int PROX_NEAR  = 5;  // opponent very close  → ram
+const int PROX_MID   = 2;  // opponent in range     → drive toward it
+const int PROX_SIDE  = 2;  // side sensor – pivot toward it during scan
+
+// ---------------------------------------------------------------------------
+//  Gyro push-resistance
+// ---------------------------------------------------------------------------
+int32_t  gyroOffsetZ        = 0;
+const int32_t GYRO_THRESHOLD = 300;  // rate threshold to trigger correction (original)
+const int      GYRO_DIV       =   7;  // divisor for correction magnitude (original)
+
+// ---------------------------------------------------------------------------
+//  State machine
+// ---------------------------------------------------------------------------
+enum State
+{
+  Pausing,
+  Waiting,
+  OpeningTurn,
+  OpeningLunge,
+  Scanning,
+  ScanCreep,   // short forward creep to reposition during search
+  Aligning,    // proportional steering toward detected opponent
+  Driving,
+  Ramming,
+  Backing,
+  EscapeTurn,
+};
+
+State    currentState    = Pausing;
+bool     justChangedState = false;
+uint32_t stateStartTime  = 0;
+uint32_t roundStartTime  = 0;
+
+// ---------------------------------------------------------------------------
+//  Scan / opponent tracking
+// ---------------------------------------------------------------------------
+int  scanDir         =  1;    // +1 = right, -1 = left
+int  opponentSide    =  1;
+int  scanSweepCount  =  0;    // how many sweeps without finding opponent
+bool scanWidened     = false; // true once we've started wider sweeps
+
+// Last steering bias recorded while sensors saw the opponent.
+// Used during Ramming to keep pushing in the right direction even when
+// the opponent is too close for the proximity sensors to register.
+int  lastRamDiff     =  0;    // fL - fR at last valid sensor reading
+
+// ---------------------------------------------------------------------------
+//  Line sensor calibration
+// ---------------------------------------------------------------------------
+int lineValues[3];
+int lineSensorThreshold[3] = {0, 0, 0};
+
+// ---------------------------------------------------------------------------
+//  Forward declarations
+// ---------------------------------------------------------------------------
+void     calibrateLineSensors();
+void     calibrateGyro();
+bool     borderDetection();
+void     gyroResistPush();
+void     changeState(State newState);
+uint32_t timeInThisState();
+
+// =============================================================================
+//  setup
+// =============================================================================
+void setup()
+{
+  lineSensors.initThreeSensors();
+  proxSensors.initThreeSensors();
+  Wire.begin();
+  imu.init();
+  imu.enableDefault();
+
+  calibrateLineSensors();
+  calibrateGyro();
+  changeState(Pausing);
+}
+
+// =============================================================================
+//  Sensor calibration
+// =============================================================================
+void calibrateLineSensors()
+{
+  // ---- White surface --------------------------------------------------------
+  display.clear();
+  display.print(F("On WHITE"));
+  display.gotoXY(0, 1);
+  display.print(F("press A"));
+  while (!buttonA.getSingleDebouncedPress()) {}
+
+  int32_t wTot[3] = {0, 0, 0};
+  for (int i = 0; i < 30; i++)
+  {
+    lineSensors.read(lineValues);
+    for (int s = 0; s < 3; s++) wTot[s] += lineValues[s];
+    delay(15);
+  }
+  int wSamp[3];
+  for (int s = 0; s < 3; s++) wSamp[s] = wTot[s] / 30;
+
+  // ---- Dark / floor surface -------------------------------------------------
+  display.clear();
+  display.print(F("On DARK"));
+  display.gotoXY(0, 1);
+  display.print(F("press A"));
+  while (!buttonA.getSingleDebouncedPress()) {}
+
+  int32_t dTot[3] = {0, 0, 0};
+  for (int i = 0; i < 30; i++)
+  {
+    lineSensors.read(lineValues);
+    for (int s = 0; s < 3; s++) dTot[s] += lineValues[s];
+    delay(15);
+  }
+  int dSamp[3];
+  for (int s = 0; s < 3; s++) dSamp[s] = dTot[s] / 30;
+
+  // Threshold sits halfway between white (high) and dark (low).
+  // borderDetection() fires when a reading drops BELOW this threshold,
+  // meaning the sensor has moved onto the dark floor outside the Dohyo.
+  for (int s = 0; s < 3; s++)
+    lineSensorThreshold[s] = (wSamp[s] + dSamp[s]) / 2;
+
+  display.clear();
+  display.print(F("Thr:"));
+  display.print(lineSensorThreshold[0]);
+  display.print(F(" "));
+  display.print(lineSensorThreshold[1]);
+  display.gotoXY(0, 1);
+  display.print(F(" "));
+  display.print(lineSensorThreshold[2]);
+  display.print(F(" OK"));
+  delay(1200);
+}
+
+void calibrateGyro()
+{
+  display.clear();
+  display.print(F("GyroCal"));
+  int32_t total = 0;
+  for (int i = 0; i < 150; i++)
+  {
+    imu.read();
+    total += imu.g.z;
+    delay(8);
+  }
+  gyroOffsetZ = total / 150;
+  display.clear();
+  display.print(F("Ready"));
+  delay(400);
+}
+
+// =============================================================================
+//  Main loop
+// =============================================================================
+void loop()
+{
+  bool buttonPress = buttonA.getSingleDebouncedPress();
+
+  // ── Pausing ────────────────────────────────────────────────────────────────
+  if (currentState == Pausing)
+  {
+    motors.setSpeeds(0, 0);
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Press A"));
+    }
+    if (millis() % 1000 < 10)
+    {
+      display.gotoXY(0, 1);
+      display.print(readBatteryMillivolts());
+      display.print(F("mV"));
+    }
+    if (buttonPress) changeState(Waiting);
+  }
+
+  // ── Waiting (5-second countdown) ──────────────────────────────────────────
+  else if (currentState == Waiting)
+  {
+    motors.setSpeeds(0, 0);
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("WAIT"));
+      buzzer.playNote(NOTE_A(4), 50, 15);
+    }
+
+    uint32_t elapsed  = timeInThisState();
+    uint32_t timeLeft = WAIT_TIME - elapsed;
+    display.gotoXY(0, 1);
+    display.print(timeLeft / 1000);
+    display.print(F("."));
+    display.print((timeLeft % 1000) / 100);
+    display.print(F("s "));
+
+    // Peek at the opponent's side during the wait so the opening turn is
+    // aimed correctly.
+    proxSensors.read();
+    int sL = proxSensors.countsLeftWithLeftLeds();
+    int sR = proxSensors.countsRightWithRightLeds();
+    if (sL > 0 || sR > 0)
+      opponentSide = (sL >= sR) ? -1 : 1;
+    scanDir = opponentSide;
+
+    if (elapsed >= WAIT_TIME)
+    {
+      roundStartTime = millis();
+      buzzer.playNote(NOTE_A(5), 100, 15);
+      changeState(OpeningTurn);
+    }
+  }
+
+  // ── OpeningTurn ────────────────────────────────────────────────────────────
+  // Rotate toward the opponent's side before lunging.
+  else if (currentState == OpeningTurn)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("TURN"));
+      ledGreen(1);
+    }
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    if (fL >= PROX_MID || fR >= PROX_MID)
+      changeState(OpeningLunge);          // already lined up – charge!
+    else if (timeInThisState() >= OPENING_TURN_TIME)
+      changeState(OpeningLunge);
+    else
+      motors.setSpeeds(opponentSide * SPEED_TURN_FAST, -opponentSide * SPEED_TURN_FAST);
+
+    borderDetection();
+  }
+
+  // ── OpeningLunge ───────────────────────────────────────────────────────────
+  // Charge straight ahead after the opening turn.
+  else if (currentState == OpeningLunge)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("LUNGE"));
+      ledRed(1);
+    }
+
+    motors.setSpeeds(SPEED_RAMMING, SPEED_RAMMING);
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    if (fL >= PROX_NEAR && fR >= PROX_NEAR)
+      changeState(Ramming);
+    else if (timeInThisState() >= OPENING_LUNGE_TIME)
+    {
+      if (fL >= PROX_MID || fR >= PROX_MID) changeState(Driving);
+      else                                   changeState(Scanning);
+    }
+
+    borderDetection();
+  }
+
+  // ── Scanning ───────────────────────────────────────────────────────────────
+  // Rotate in a widening sweep to find the opponent.
+  // Every SCAN_SWEEP_CYCLES sweeps we do a short creep to reposition.
+  else if (currentState == Scanning)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Scan"));
+      scanSweepCount++;
+    }
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+    int sL = proxSensors.countsLeftWithLeftLeds();
+    int sR = proxSensors.countsRightWithRightLeds();
+
+    if (fL >= PROX_NEAR && fR >= PROX_NEAR)
+    {
+      changeState(Ramming);
+    }
+    else if (fL >= PROX_MID || fR >= PROX_MID)
+    {
+      changeState(Aligning);
+    }
+    else if (sL >= PROX_SIDE || sR >= PROX_SIDE)
+    {
+      // Side detection → spin toward it
+      if (sL > sR) { scanDir = -1; motors.setSpeeds(-SPEED_TURN_FAST, SPEED_TURN_FAST); }
+      else          { scanDir =  1; motors.setSpeeds( SPEED_TURN_FAST,-SPEED_TURN_FAST); }
+    }
+    else
+    {
+      // Standard sweep; widen angle after several failed sweeps
+      int sweepSpeed = (scanSweepCount > 4) ? SPEED_TURN_FAST : SPEED_TURN_SLOW;
+      motors.setSpeeds(scanDir * sweepSpeed, -scanDir * sweepSpeed);
+
+      // After enough sweep time without contact, creep forward to
+      // reposition toward the centre of the Dohyo.
+      if (timeInThisState() > 500 && scanSweepCount % 3 == 0)
+        changeState(ScanCreep);
+    }
+
+    borderDetection();
+  }
+
+  // ── ScanCreep ──────────────────────────────────────────────────────────────
+  // Brief forward movement during search to avoid circling the edge.
+  else if (currentState == ScanCreep)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Creep"));
+    }
+
+    motors.setSpeeds(SPEED_CREEP, SPEED_CREEP);
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    if (fL >= PROX_NEAR && fR >= PROX_NEAR)
+      changeState(Ramming);
+    else if (fL >= PROX_MID || fR >= PROX_MID)
+      changeState(Aligning);
+    else if (timeInThisState() >= SCAN_CREEP_TIME)
+      changeState(Scanning);
+
+    borderDetection();
+  }
+
+  // ── Aligning ───────────────────────────────────────────────────────────────
+  // Proportional steering to centre the opponent in front before ramming.
+  else if (currentState == Aligning)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Align"));
+    }
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    if (fL >= PROX_NEAR && fR >= PROX_NEAR)
+    {
+      changeState(Ramming);
+    }
+    else if (fL < 1 && fR < 1)
+    {
+      // Lost sight – go back to scanning
+      changeState(Scanning);
+    }
+    else if (timeInThisState() >= ALIGN_TIMEOUT)
+    {
+      changeState(Driving);
+    }
+    else
+    {
+      // Proportional: positive diff → target is to the left → steer left
+      int diff = fL - fR;
+      int base = SPEED_FORWARD;
+      // Scale correction: each unit of difference = 90 PWM
+      int correction = diff * 90;
+      int leftSpeed  = constrain(base - correction, -400, 400);
+      int rightSpeed = constrain(base + correction, -400, 400);
+      motors.setSpeeds(leftSpeed, rightSpeed);
+      gyroResistPush();
+    }
+
+    borderDetection();
+  }
+
+  // ── Driving ────────────────────────────────────────────────────────────────
+  // Close the gap with proportional steering; escalate to Ramming when close.
+  else if (currentState == Driving)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Drive"));
+    }
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    if (fL >= PROX_NEAR && fR >= PROX_NEAR)
+    {
+      changeState(Ramming);
+    }
+    else if (fL >= PROX_MID || fR >= PROX_MID)
+    {
+      int diff       = fL - fR;
+      int correction = diff * 80;
+      int lSpd = constrain(SPEED_FORWARD - correction, -400, 400);
+      int rSpd = constrain(SPEED_FORWARD + correction, -400, 400);
+      motors.setSpeeds(lSpd, rSpd);
+      gyroResistPush();
+    }
+    else
+    {
+      changeState(Scanning);
+    }
+
+    borderDetection();
+  }
+
+  // ── Ramming ────────────────────────────────────────────────────────────────
+  // Full-power push. Once contact is made the opponent is often too close
+  // for the proximity sensors to register — keep pushing anyway using the
+  // last recorded steering diff. Only abort on full timeout; border safety
+  // is suppressed on the rear sensors while ramming (see borderDetection).
+  else if (currentState == Ramming)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      lastRamDiff = 0;   // start fresh; will update as soon as sensors see target
+      display.clear();
+      display.print(F("RAM!"));
+      ledRed(1);
+    }
+
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    // Update last-known heading whenever sensors still see the opponent.
+    if (fL > 0 || fR > 0)
+      lastRamDiff = fL - fR;
+
+    // Small proportional correction keeps us aimed correctly even after
+    // the opponent is too close to register on proximity sensors.
+    int correction = lastRamDiff * 30;
+    int lSpd = constrain(SPEED_RAMMING - correction, 0, 400);
+    int rSpd = constrain(SPEED_RAMMING + correction, 0, 400);
+    motors.setSpeeds(lSpd, rSpd);
+    gyroResistPush();
+
+    // Only give up after the full timeout — a zero reading alone means
+    // contact, not that the opponent has escaped.
+    if (timeInThisState() > RAMMING_TIMEOUT)
+      changeState(Scanning);
+
+    borderDetection();
+  }
+
+  // ── Backing ────────────────────────────────────────────────────────────────
+  // Reverse away from the border.  Border detection re-fires here only if
+  // BOTH sensors are dark (completely off the edge), triggering a direction flip.
+  else if (currentState == Backing)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("BACK!"));
+      ledYellow(1);
+    }
+
+    motors.setSpeeds(SPEED_REVERSE, SPEED_REVERSE);
+
+    if (timeInThisState() >= REVERSE_TIME)
+      changeState(EscapeTurn);
+  }
+
+  // ── EscapeTurn ─────────────────────────────────────────────────────────────
+  // Pivot to face back toward the centre, then resume scanning.
+  else if (currentState == EscapeTurn)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("EscTurn"));
+    }
+
+    motors.setSpeeds(scanDir * SPEED_TURN_FAST, -scanDir * SPEED_TURN_FAST);
+
+    if (timeInThisState() >= ESCAPE_TURN_TIME)
+    {
+      scanSweepCount = 0;
+      changeState(ScanCreep);  // drive toward center before scanning again
+    }
+
+    // Safety: if a sensor hits dark again while escaping, reverse scan direction.
+    borderDetection();
+  }
+
+  else
+  {
+    changeState(Pausing);
+  }
+}
+
+// =============================================================================
+//  borderDetection
+//
+//  The Dohyo has a 1-inch WHITE border ring; the floor OUTSIDE is dark.
+//  Sensors read LOW (dark) when they cross the white border onto the floor.
+//
+//  Fires whenever a sensor reads BELOW the calibrated midpoint threshold.
+//  Returns true if an escape manoeuvre was triggered.
+//
+//  Priority: border safety always overrides the current combat state.
+// =============================================================================
+bool borderDetection()
+{
+  lineSensors.read(lineValues);
+
+  bool bL = (lineValues[0] < lineSensorThreshold[0]);
+  bool bC = (lineValues[1] < lineSensorThreshold[1]);
+  bool bR = (lineValues[2] < lineSensorThreshold[2]);
+
+  if (!bL && !bC && !bR)
+    return false;
+
+  // ── Ramming: only the FRONT sensors should stop a push. ───────────────────
+  // When we are ramming, our REAR is toward the center and FRONT is toward
+  // the opponent/edge. The line sensors are at the FRONT of the Zumo, so if
+  // they fire during a ram we really are about to go off — stop and escape.
+  // But if somehow only the rear area trips (bC while pushing hard), that is
+  // us being pushed from behind: do NOT retreat; instead spin 180° and face
+  // the threat. We detect this as bC-only with both front prox still reading.
+  if (currentState == Ramming)
+  {
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+    bool pushingOpponent = (fL > 0 || fR > 0 || timeInThisState() < 600);
+
+    if (pushingOpponent && !bL && !bR && bC)
+    {
+      // Centre sensor only + actively pushing = being shoved from behind.
+      // Spin 180° to face the real threat instead of blindly reversing.
+      scanDir = -scanDir;
+      changeState(EscapeTurn);
+      return true;
+    }
+    // Front or side sensors dark while ramming → genuine edge, escape normally.
+    if (!pushingOpponent || bL || bR)
+    {
+      // Fall through to normal escape logic below.
+    }
+    else
+    {
+      return false;  // pushing opponent, no edge sensors — keep ramming
+    }
+  }
+
+  // During Backing: only respond to both-sensors-dark (original behavior).
+  if (currentState == Backing)
+  {
+    if (bL && bR)
+    {
+      scanDir = -scanDir;
+      changeState(Backing);
+      return true;
+    }
+    return false;
+  }
+
+  // During EscapeTurn – only react to fresh triggers to avoid thrashing.
+  if (currentState == EscapeTurn)
+  {
+    if (bL && bR)
+    {
+      scanDir = -scanDir;
+      changeState(Backing);
+      return true;
+    }
+    return false;
+  }
+
+  // Normal border response: choose the escape direction to face inward.
+  if (bL && !bR)
+  {
+    scanDir = 1;          // left sensor on dark → turn right (into arena)
+    changeState(Backing);
+    return true;
+  }
+  if (bR && !bL)
+  {
+    scanDir = -1;         // right sensor on dark → turn left (into arena)
+    changeState(Backing);
+    return true;
+  }
+  if (bL && bR)
+  {
+    scanDir = -scanDir;
+    changeState(Backing);
+    return true;
+  }
+  if (bC)
+  {
+    changeState(Backing);
+    return true;
+  }
+
+  return false;
+}
+
+// =============================================================================
+//  gyroResistPush
+//
+//  Reads the Z-axis gyro rate.  If the bot is being rotated faster than
+//  GYRO_THRESHOLD (i.e. an opponent is pushing us sideways) apply a
+//  differential correction to both wheels to counteract the rotation.
+// =============================================================================
+void gyroResistPush()
+{
+  imu.read();
+  int32_t gyroZ = imu.g.z - gyroOffsetZ;
+
+  if (abs(gyroZ) > GYRO_THRESHOLD)
+  {
+    int correction = constrain((int)(gyroZ / GYRO_DIV), -180, 180);
+    int lSpd = constrain(SPEED_FORWARD - correction, -400, 400);
+    int rSpd = constrain(SPEED_FORWARD + correction, -400, 400);
+    motors.setSpeeds(lSpd, rSpd);
+  }
+}
+
+// =============================================================================
+//  Helpers
+// =============================================================================
+uint32_t timeInThisState()
+{
+  return (uint32_t)(millis() - stateStartTime);
+}
+
+void changeState(State newState)
+{
+  currentState      = newState;
+  justChangedState  = true;
+  stateStartTime    = millis();
+  ledRed(0);
+  ledYellow(0);
+  ledGreen(0);
+  display.clear();
+}
