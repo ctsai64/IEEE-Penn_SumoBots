@@ -11,12 +11,12 @@ Zumo32U4IMU     imu;
 
 int lineValues[3];
 const int reverseSpeed   = -200;
-const int turnSpeed      = 200;
+const int turnSpeed      = 100;
 const int fastTurnSpeed  = 350;
 const int forwardSpeed   = 300;
 const int rammingSpeed   = 400;
 
-const int waitTime       = 5200;
+const int waitTime       = 5200;  // ~5.2 s covers the 5-second rule (6.5)
 
 const int reverseTime    = 100;
 const int escapeTurnTime = 180;
@@ -39,7 +39,7 @@ enum State
   Scanning,
   Driving,
   Ramming,
-  Backing,    
+  Backing,
   EscapeTurn,
 };
 
@@ -74,6 +74,7 @@ void setup()
 
 void calibrateLineSensors()
 {
+  // --- White surface sample ---
   display.clear();
   display.print(F("On WHITE"));
   display.gotoXY(0, 1);
@@ -103,6 +104,7 @@ void calibrateLineSensors()
   display.print(whiteSamples[2]);
   delay(800);
 
+  // --- Dark surface sample ---
   display.clear();
   display.print(F("On DARK"));
   display.gotoXY(0, 1);
@@ -135,6 +137,10 @@ void calibrateLineSensors()
   for (int s = 0; s < 3; s++)
   {
     whiteBaseline[s]       = whiteSamples[s];
+    // Threshold sits halfway between white (high) and dark (low).
+    // borderDetection() now fires when a reading drops BELOW this
+    // threshold, meaning the sensor has moved onto a dark surface
+    // (i.e. the floor outside the Dohyo).
     lineSensorThreshold[s] = (whiteSamples[s] + darkSamples[s]) / 2;
   }
 
@@ -405,13 +411,26 @@ void loop()
   else
     changeState(Pausing);
 }
+
+// ---------------------------------------------------------------------------
+// borderDetection
+//
+// The IEEE Dohyo is a raised wooden circle with a 1-inch white border ring.
+// The floor *outside* the Dohyo is dark.
+//
+// CHANGED from original: out-of-bounds is now triggered when a sensor reads
+// BELOW the threshold (dark surface), not above it (white surface).
+// A low reflectance reading ( < threshold ) means the sensor has rolled onto
+// the dark floor outside the arena and the bot must retreat.
+// ---------------------------------------------------------------------------
 bool borderDetection()
 {
   lineSensors.read(lineValues);
 
-  bool bL = (lineValues[0] > lineSensorThreshold[0]);
-  bool bC = (lineValues[1] > lineSensorThreshold[1]);
-  bool bR = (lineValues[2] > lineSensorThreshold[2]);
+  // Dark surface detected when reading drops below the midpoint threshold.
+  bool bL = (lineValues[0] < lineSensorThreshold[0]);
+  bool bC = (lineValues[1] < lineSensorThreshold[1]);
+  bool bR = (lineValues[2] < lineSensorThreshold[2]);
 
   if (!bL && !bC && !bR)
     return false;
@@ -429,14 +448,14 @@ bool borderDetection()
 
   if (bL && !bR)
   {
-    scanDir = 1;
+    scanDir = 1;        // left sensor on dark -> turn right (scanDir = 1)
     changeState(Backing);
     return true;
   }
 
   if (bR && !bL)
   {
-    scanDir = -1;
+    scanDir = -1;       // right sensor on dark -> turn left (scanDir = -1)
     changeState(Backing);
     return true;
   }
