@@ -10,22 +10,21 @@ Zumo32U4ProximitySensors proxSensors;
 Zumo32U4IMU     imu;
 
 int lineValues[3];
-const int reverseSpeed   = -200;
-const int turnSpeed      = 100;
+const int reverseSpeed   = -300;   // faster reverse to get away from edge
+const int turnSpeed      = 60;     // slower search spin for better sensor reads
 const int fastTurnSpeed  = 350;
 const int forwardSpeed   = 300;
-const int rammingSpeed   = 400;
+const int rammingSpeed   = 400;    // full power ram
 
 const int waitTime       = 5200;
 
-// *** CHANGED: back up longer so the robot actually reaches the center
-const int reverseTime    = 400;
-// *** CHANGED: spin longer so it does a wide search sweep (~270-360°)
-const int escapeTurnTime = 800;
+const int reverseTime    = 600;    // longer reverse to really reach center
+const int escapeTurnTime = 900;    // wide sweep spin
 
 const int rammingTimeout   = 1500;
 const int openingTurnTime  = 260;
 const int openingLungeTime = 600;
+const int repositionTime   = 400;  // drive inward after spin if no target found
 
 int whiteBaseline[3]       = {0, 0, 0};
 int lineSensorThreshold[3] = {0, 0, 0};
@@ -44,6 +43,7 @@ enum State
   Ramming,
   Backing,
   EscapeTurn,
+  Reposition,
 };
 
 State currentState = Pausing;
@@ -272,7 +272,7 @@ void loop()
     int frontL = proxSensors.countsFrontWithLeftLeds();
     int frontR = proxSensors.countsFrontWithRightLeds();
 
-    if (frontL >= 5 && frontR >= 5)
+    if (frontL >= 4 && frontR >= 4)
       changeState(Ramming);
     else if (timeInThisState() >= openingLungeTime)
     {
@@ -326,7 +326,7 @@ void loop()
 
     if (frontL >= 2 || frontR >= 2)
     {
-      if (frontL >= 5 && frontR >= 5)
+      if (frontL >= 4 && frontR >= 4)
       {
         changeState(Ramming);
       }
@@ -411,6 +411,32 @@ void loop()
     if ((frontL >= 2 || frontR >= 2) && timeInThisState() > 100)
       changeState(Driving);   // opponent found mid-spin, lock on!
     else if (timeInThisState() >= escapeTurnTime)
+      changeState(Reposition); // no target found — drive inward first
+
+    borderDetection();
+  }
+
+  else if (currentState == Reposition)
+  {
+    // Drive forward (away from edge) to get toward center before scanning
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("REPOS"));
+      ledGreen(1);
+    }
+
+    motors.setSpeeds(forwardSpeed, forwardSpeed);
+
+    // If we spot the opponent while repositioning, lock on immediately
+    proxSensors.read();
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+
+    if (frontL >= 2 || frontR >= 2)
+      changeState(Driving);
+    else if (timeInThisState() >= repositionTime)
       changeState(Scanning);
 
     borderDetection();
