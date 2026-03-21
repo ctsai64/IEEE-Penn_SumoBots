@@ -32,6 +32,8 @@ const int FORWARD_SPEED         =  300;   // cautious advance
 const int SEARCH_SPEED          =  200;   // slow rotate while hunting
 const int TURN_SPEED            =  350;   // fast in-place turn
 const int REVERSE_SPEED         = -350;   // back away from border
+uint32_t lastSeenMs = 0;
+const uint32_t COMMIT_MS = 400;
 
 // Timing for the opening move
 const uint32_t OPENING_TURN_MS  =  260;   // spin before initial lunge
@@ -205,6 +207,7 @@ void loop()
 
       if (checkOpponent(leftCount, rightCount))
       {
+        lastSeenMs = millis(); 
         motors.setSpeeds(0, 0);
         setState(STATE_ATTACK);
       }
@@ -228,6 +231,7 @@ void loop()
 
       if (checkOpponent(leftCount, rightCount))
       {
+        lastSeenMs = millis(); 
         if (leftCount > rightCount + 1)
         {
           // Opponent veering left — steer left
@@ -244,9 +248,14 @@ void loop()
           motors.setSpeeds(RAMMING_SPEED, RAMMING_SPEED);
         }
       }
+        else if (millis() - lastSeenMs < COMMIT_MS)
+      {
+        // Sensor flickered off but we're still committed — keep ramming full
+        motors.setSpeeds(RAMMING_SPEED, RAMMING_SPEED);
+      }
       else
       {
-        // Lost the opponent
+        // Truly lost the opponent — go search
         motors.setSpeeds(0, 0);
         setState(STATE_SEARCH);
       }
