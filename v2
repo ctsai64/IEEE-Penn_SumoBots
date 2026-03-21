@@ -1,0 +1,703 @@
+#include <Wire.h>
+#include <Zumo32U4.h>
+
+Zumo32U4OLED display;
+Zumo32U4ButtonA buttonA;
+Zumo32U4Buzzer buzzer;
+Zumo32U4Motors motors;
+Zumo32U4LineSensors lineSensors;
+Zumo32U4ProximitySensors proxSensors;
+Zumo32U4IMU imu;
+
+int lineValues[3];
+
+// ---------------- SPEEDS ----------------
+const int reverseSpeed   = -300;
+const int turnSpeed      = 280;
+const int fastTurnSpeed  = 400;
+const int forwardSpeed   = 360;
+const int rammingSpeed   = 400;
+
+// ---------------- TIMING ----------------
+const uint16_t waitTime          = 5000;
+const uint16_t reverseTime       = 170;
+const uint16_t escapeTurnTime    = 340;
+const uint16_t cornerReverseTime = 260;
+const uint16_t cornerTurnTime    = 500;
+const uint16_t openingTurnTime   = 180;
+const uint16_t openingLungeTime  = 900;
+const uint16_t rammingTimeout    = 2500;
+const uint16_t targetMemoryTime  = 350;
+const uint16_t borderCooldownMs  = 220;
+
+// ---------------- THRESHOLDS ----------------
+const int frontDetectThreshold   = 1;  // weak signal = chase
+const int frontStrongThreshold   = 4;  // strong centered signal = ram
+const int sideDetectThreshold    = 1;
+const int32_t PUSH_RATE_THRESHOLD = 300;
+
+int whiteBaseline[3]       = {0, 0, 0};
+int lineSensorThreshold[3] = {0, 0, 0};
+
+int32_t gyroOffsetZ = 0;
+
+enum State
+{
+  Pausing,
+  Waiting,
+  OpeningTurn,
+  OpeningLunge,
+  Scanning,
+  Driving,
+  Ramming,
+  Backing,
+  EscapeTurn,
+};
+
+State currentState = Pausing;
+
+int scanDir = 1;                 // 1 = turn right, -1 = turn left
+int lastKnownOpponentDir = 1;    // memory of last seen target direction
+int openingDir = 1;
+
+bool justChangedState = false;
+bool escapeFromCorner = false;
+
+uint32_t stateStartTime = 0;
+uint32_t roundStartTime = 0;
+uint32_t lastBorderEventTime = 0;
+uint32_t lastSeenOpponentTime = 0;
+
+// ---------------- HELPERS ----------------
+void calibrateLineSensors();
+void calibrateGyro();
+bool borderDetection();
+void gyroResistPush();
+void changeState(State newState);
+uint32_t timeInThisState();
+void updateOpponentMemory();
+
+void setup()
+{
+  lineSensors.initThreeSensors();
+  proxSensors.initThreeSensors();
+
+  Wire.begin();
+  imu.init();
+  imu.enableDefault();
+
+  calibrateLineSensors();
+  calibrateGyro();
+
+  changeState(Pausing);
+}
+
+void loop()
+{
+  bool buttonPress = buttonA.getSingleDebouncedPress();
+
+  if (currentState == Pausing)
+  {
+    motors.setSpeeds(0, 0);
+
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Press A"));
+    }
+
+    if (millis() % 1000 < 15)
+    {
+      display.gotoXY(0, 1);
+      display.print(readBatteryMillivolts());
+      display.print(F("mV   "));
+    }
+
+    if (buttonPress)
+      changeState(Waiting);
+  }
+
+  else if (currentState == Waiting)
+  {
+    motors.setSpeeds(0, 0);
+
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("WAIT"));
+      buzzer.playNote(NOTE_A(4), 50, 15);
+    }
+
+    uint32_t elapsed = timeInThisState();
+    uint32_t timeLeft = (elapsed < waitTime) ? (waitTime - elapsed) : 0;
+
+    display.gotoXY(0, 1);
+    display.print(timeLeft / 1000);
+    display.print(F("."));
+    display.print((timeLeft % 1000) / 100);
+    display.print(F("s  "));
+
+    updateOpponentMemory();
+    openingDir = lastKnownOpponentDir;
+    scanDir = openingDir;
+
+    if (elapsed >= waitTime)
+    {
+      roundStartTime = millis();
+      buzzer.playNote(NOTE_A(5), 100, 15);
+      changeState(OpeningTurn);
+    }
+  }
+
+  else if (currentState == OpeningTurn)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("TURN"));
+      ledGreen(1);
+      ledRed(0);
+      ledYellow(0);
+    }
+
+    updateOpponentMemory();
+
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+
+    if (frontL >= frontDetectThreshold || frontR >= frontDetectThreshold)
+    {
+      changeState(OpeningLunge);
+      return;
+    }
+
+    motors.setSpeeds(openingDir * fastTurnSpeed, -openingDir * fastTurnSpeed);
+
+    if (timeInThisState() >= openingTurnTime)
+      changeState(OpeningLunge);
+
+    borderDetection();
+  }
+
+  else if (currentState == OpeningLunge)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("LUNGE"));
+      ledRed(1);
+      ledGreen(0);
+      ledYellow(0);
+    }
+
+    updateOpponentMemory();
+    motors.setSpeeds(rammingSpeed, rammingSpeed);
+
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+
+    if (frontL >= frontStrongThreshold && frontR >= frontStrongThreshold)
+    {
+      changeState(Ramming);
+      return;
+    }
+
+    if (timeInThisState() >= openingLungeTime)
+    {
+      if (frontL >= frontDetectThreshold || frontR >= frontDetectThreshold)
+        changeState(Driving);
+      else
+        changeState(Scanning);
+    }
+
+    borderDetection();
+  }
+
+  else if (currentState == Scanning)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("SCAN"));
+      ledGreen(0);
+      ledRed(0);
+      ledYellow(0);
+    }
+
+    updateOpponentMemory();
+
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+    int sideL  = proxSensors.countsLeftWithLeftLeds();
+    int sideR  = proxSensors.countsRightWithRightLeds();
+
+    if (frontL >= frontDetectThreshold || frontR >= frontDetectThreshold)
+    {
+      changeState(Driving);
+      return;
+    }
+
+    if (sideL >= sideDetectThreshold || sideR >= sideDetectThreshold)
+    {
+      // Hard snap turn toward side target
+      if (sideL > sideR)
+      {
+        lastKnownOpponentDir = -1;
+        motors.setSpeeds(-400, 400);
+      }
+      else
+      {
+        lastKnownOpponentDir = 1;
+        motors.setSpeeds(400, -400);
+      }
+    }
+    else
+    {
+      // Fast search spin in last known direction
+      motors.setSpeeds(lastKnownOpponentDir * 320, -lastKnownOpponentDir * 320);
+    }
+
+    borderDetection();
+  }
+
+  else if (currentState == Driving)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("DRIVE"));
+    }
+
+    updateOpponentMemory();
+
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+    int sideL  = proxSensors.countsLeftWithLeftLeds();
+    int sideR  = proxSensors.countsRightWithRightLeds();
+
+    bool seeFront = (frontL >= frontDetectThreshold || frontR >= frontDetectThreshold);
+    bool seeSide  = (sideL >= sideDetectThreshold || sideR >= sideDetectThreshold);
+
+    if (frontL >= frontStrongThreshold && frontR >= frontStrongThreshold)
+    {
+      changeState(Ramming);
+      return;
+    }
+
+    if (seeFront)
+    {
+      // Aggressive steering, not gentle proportional control
+      int diff = frontL - frontR;
+
+      if (diff >= 2)
+      {
+        // opponent more to left
+        motors.setSpeeds(180, 400);
+      }
+      else if (diff <= -2)
+      {
+        // opponent more to right
+        motors.setSpeeds(400, 180);
+      }
+      else if (diff > 0)
+      {
+        motors.setSpeeds(250, 400);
+      }
+      else if (diff < 0)
+      {
+        motors.setSpeeds(400, 250);
+      }
+      else
+      {
+        motors.setSpeeds(400, 400);
+      }
+
+      gyroResistPush();
+    }
+    else if (seeSide)
+    {
+      // Lost from front but still near side -> violent reacquire
+      if (sideL > sideR)
+      {
+        lastKnownOpponentDir = -1;
+        motors.setSpeeds(-320, 400);
+      }
+      else
+      {
+        lastKnownOpponentDir = 1;
+        motors.setSpeeds(400, -320);
+      }
+    }
+    else if (millis() - lastSeenOpponentTime < targetMemoryTime)
+    {
+      // Keep committing in last direction briefly instead of immediately giving up
+      motors.setSpeeds(lastKnownOpponentDir * 350, -lastKnownOpponentDir * 350);
+    }
+    else
+    {
+      changeState(Scanning);
+      return;
+    }
+
+    borderDetection();
+  }
+
+  else if (currentState == Ramming)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("RAM!"));
+      ledRed(1);
+      ledGreen(0);
+      ledYellow(0);
+    }
+
+    updateOpponentMemory();
+
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+    int sideL  = proxSensors.countsLeftWithLeftLeds();
+    int sideR  = proxSensors.countsRightWithRightLeds();
+
+    // Stay aggressive
+    int left = 400;
+    int right = 400;
+
+    if (frontL > frontR + 1)
+    {
+      left = 300;
+      right = 400;
+      lastKnownOpponentDir = -1;
+    }
+    else if (frontR > frontL + 1)
+    {
+      left = 400;
+      right = 300;
+      lastKnownOpponentDir = 1;
+    }
+
+    motors.setSpeeds(left, right);
+    gyroResistPush();
+
+    bool noFront = (frontL == 0 && frontR == 0);
+    bool sideSeen = (sideL >= sideDetectThreshold || sideR >= sideDetectThreshold);
+
+    if (noFront && timeInThisState() > 500)
+    {
+      if (sideSeen)
+        changeState(Driving);
+      else
+        changeState(Scanning);
+      return;
+    }
+
+    if (timeInThisState() > rammingTimeout)
+    {
+      changeState(Scanning);
+      return;
+    }
+
+    borderDetection();
+  }
+
+  else if (currentState == Backing)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("BACK"));
+      ledYellow(1);
+      ledRed(0);
+      ledGreen(0);
+    }
+
+    updateOpponentMemory();
+    motors.setSpeeds(reverseSpeed, reverseSpeed);
+
+    uint16_t requiredReverse = escapeFromCorner ? cornerReverseTime : reverseTime;
+
+    if (timeInThisState() >= requiredReverse)
+      changeState(EscapeTurn);
+  }
+
+  else if (currentState == EscapeTurn)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("ESC"));
+      ledYellow(1);
+      ledRed(0);
+      ledGreen(0);
+    }
+
+    updateOpponentMemory();
+
+    int frontL = proxSensors.countsFrontWithLeftLeds();
+    int frontR = proxSensors.countsFrontWithRightLeds();
+    int sideL  = proxSensors.countsLeftWithLeftLeds();
+    int sideR  = proxSensors.countsRightWithRightLeds();
+
+    if (frontL >= frontDetectThreshold || frontR >= frontDetectThreshold)
+    {
+      changeState(Driving);
+      return;
+    }
+
+    if (sideL >= sideDetectThreshold || sideR >= sideDetectThreshold)
+    {
+      if (sideL > sideR)
+      {
+        lastKnownOpponentDir = -1;
+        motors.setSpeeds(-400, 400);
+      }
+      else
+      {
+        lastKnownOpponentDir = 1;
+        motors.setSpeeds(400, -400);
+      }
+    }
+    else
+    {
+      motors.setSpeeds(lastKnownOpponentDir * 380, -lastKnownOpponentDir * 380);
+    }
+
+    uint16_t requiredTurn = escapeFromCorner ? cornerTurnTime : escapeTurnTime;
+
+    if (timeInThisState() >= requiredTurn)
+    {
+      escapeFromCorner = false;
+      changeState(Scanning);
+    }
+  }
+
+  else
+  {
+    changeState(Pausing);
+  }
+}
+
+void updateOpponentMemory()
+{
+  proxSensors.read();
+
+  int frontL = proxSensors.countsFrontWithLeftLeds();
+  int frontR = proxSensors.countsFrontWithRightLeds();
+  int sideL  = proxSensors.countsLeftWithLeftLeds();
+  int sideR  = proxSensors.countsRightWithRightLeds();
+
+  bool seen = false;
+
+  // Prefer side info first for reacquisition
+  if (sideL > sideR && sideL >= sideDetectThreshold)
+  {
+    lastKnownOpponentDir = -1;
+    seen = true;
+  }
+  else if (sideR > sideL && sideR >= sideDetectThreshold)
+  {
+    lastKnownOpponentDir = 1;
+    seen = true;
+  }
+  else if (frontL > frontR && frontL >= frontDetectThreshold)
+  {
+    lastKnownOpponentDir = -1;
+    seen = true;
+  }
+  else if (frontR > frontL && frontR >= frontDetectThreshold)
+  {
+    lastKnownOpponentDir = 1;
+    seen = true;
+  }
+  else if ((frontL >= frontDetectThreshold) || (frontR >= frontDetectThreshold))
+  {
+    seen = true;
+  }
+
+  if (seen)
+    lastSeenOpponentTime = millis();
+}
+
+bool borderDetection()
+{
+  // prevent repeated edge-trigger loops during escape
+  if (millis() - lastBorderEventTime < borderCooldownMs)
+    return false;
+
+  lineSensors.read(lineValues);
+
+  bool bL = (lineValues[0] < lineSensorThreshold[0]);
+  bool bC = (lineValues[1] < lineSensorThreshold[1]);
+  bool bR = (lineValues[2] < lineSensorThreshold[2]);
+
+  if (!bL && !bC && !bR)
+    return false;
+
+  escapeFromCorner = false;
+
+  if ((bL && bR) || (bC && (bL || bR)))
+  {
+    // likely corner or head-on border contact
+    escapeFromCorner = true;
+    scanDir = -lastKnownOpponentDir;
+  }
+  else if (bL && !bR)
+  {
+    // left sees border -> turn right
+    scanDir = 1;
+  }
+  else if (bR && !bL)
+  {
+    // right sees border -> turn left
+    scanDir = -1;
+  }
+  else if (bC)
+  {
+    scanDir = -lastKnownOpponentDir;
+  }
+
+  lastBorderEventTime = millis();
+  changeState(Backing);
+  return true;
+}
+
+void gyroResistPush()
+{
+  imu.read();
+  int32_t gyroZ = imu.g.z - gyroOffsetZ;
+
+  if (abs(gyroZ) > PUSH_RATE_THRESHOLD)
+  {
+    int correction = constrain((int)(gyroZ / 7), -120, 120);
+
+    int leftSpeed  = constrain(400 - correction, -400, 400);
+    int rightSpeed = constrain(400 + correction, -400, 400);
+
+    motors.setSpeeds(leftSpeed, rightSpeed);
+  }
+}
+
+uint32_t timeInThisState()
+{
+  return millis() - stateStartTime;
+}
+
+void changeState(State newState)
+{
+  currentState = newState;
+  justChangedState = true;
+  stateStartTime = millis();
+  display.clear();
+}
+
+void calibrateLineSensors()
+{
+  // WHITE sample
+  display.clear();
+  display.print(F("On WHITE"));
+  display.gotoXY(0, 1);
+  display.print(F("press A"));
+  while (!buttonA.getSingleDebouncedPress()) {}
+
+  int32_t whiteTotals[3] = {0, 0, 0};
+  for (int i = 0; i < 20; i++)
+  {
+    lineSensors.read(lineValues);
+    whiteTotals[0] += lineValues[0];
+    whiteTotals[1] += lineValues[1];
+    whiteTotals[2] += lineValues[2];
+    delay(20);
+  }
+
+  int whiteSamples[3];
+  for (int i = 0; i < 3; i++)
+    whiteSamples[i] = whiteTotals[i] / 20;
+
+  display.clear();
+  display.print(F("W:"));
+  display.print(whiteSamples[0]);
+  display.print(F(" "));
+  display.print(whiteSamples[1]);
+  display.gotoXY(0, 1);
+  display.print(F("  "));
+  display.print(whiteSamples[2]);
+  delay(800);
+
+  // DARK sample
+  display.clear();
+  display.print(F("On DARK"));
+  display.gotoXY(0, 1);
+  display.print(F("press A"));
+  while (!buttonA.getSingleDebouncedPress()) {}
+
+  int32_t darkTotals[3] = {0, 0, 0};
+  for (int i = 0; i < 20; i++)
+  {
+    lineSensors.read(lineValues);
+    darkTotals[0] += lineValues[0];
+    darkTotals[1] += lineValues[1];
+    darkTotals[2] += lineValues[2];
+    delay(20);
+  }
+
+  int darkSamples[3];
+  for (int i = 0; i < 3; i++)
+    darkSamples[i] = darkTotals[i] / 20;
+
+  display.clear();
+  display.print(F("D:"));
+  display.print(darkSamples[0]);
+  display.print(F(" "));
+  display.print(darkSamples[1]);
+  display.gotoXY(0, 1);
+  display.print(F("  "));
+  display.print(darkSamples[2]);
+  delay(800);
+
+  for (int i = 0; i < 3; i++)
+  {
+    whiteBaseline[i] = whiteSamples[i];
+    lineSensorThreshold[i] = (whiteSamples[i] + darkSamples[i]) / 2;
+  }
+
+  display.clear();
+  display.print(F("Thr:"));
+  display.print(lineSensorThreshold[0]);
+  display.print(F(" "));
+  display.print(lineSensorThreshold[1]);
+  display.gotoXY(0, 1);
+  display.print(F("    "));
+  display.print(lineSensorThreshold[2]);
+  display.print(F(" OK"));
+  delay(1200);
+}
+
+void calibrateGyro()
+{
+  display.clear();
+  display.print(F("GyroCal"));
+
+  int32_t total = 0;
+  for (int i = 0; i < 100; i++)
+  {
+    imu.read();
+    total += imu.g.z;
+    delay(10);
+  }
+
+  gyroOffsetZ = total / 100;
+
+  display.clear();
+  display.print(F("Ready"));
+  delay(400);
+}
