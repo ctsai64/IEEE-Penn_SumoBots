@@ -1,0 +1,655 @@
+#include <Wire.h>
+#include <Zumo32U4.h>
+
+Zumo32U4OLED             display;
+Zumo32U4ButtonA          buttonA;
+Zumo32U4Buzzer           buzzer;
+Zumo32U4Motors           motors;
+Zumo32U4LineSensors      lineSensors;
+Zumo32U4ProximitySensors proxSensors;
+Zumo32U4IMU              imu;
+
+// === Motor speeds ===
+const int reverseSpeed   = -300;   // from doc3: fast reverse away from edge
+const int turnSpeed      =  120;   // enough torque to produce clear gyro signal above stall threshold
+const int fastTurnSpeed  =  350;
+const int forwardSpeed   =  300;
+const int rammingSpeed   =  400;
+
+// === Timing constants ===
+const uint32_t waitTime       = 5200;
+const uint32_t reverseTime    =  600;  // from doc3: long reverse to center
+const uint32_t escapeTurnTime =  900;  // from doc3: wide sweep spin
+const uint32_t repositionTime =  400;  // from doc3: drive inward after sweep
+const uint32_t openRamTime    =  800;  // opening charge duration
+
+// === Adaptive ram (from doc2) ===
+const uint32_t RAM_MAX_MS      = 1100;
+const uint32_t RAM_MIN_MS      =  200;
+const uint32_t RAM_PER_UNIT_MS =  150;
+
+// === Proximity thresholds (from doc2) ===
+const int PROX_COMMIT = 3;   // front avg to commit to full ram
+
+// === Gyro ===
+int32_t       gyroOffsetZ         = 0;
+const int32_t PUSH_RATE_THRESHOLD = 300;
+const int32_t STALL_GYRO_THRESH  = 120;  // lowered: clear gap between turning at 120 and actually stuck
+const uint32_t STALL_TIME_MS     = 150;  // confirmation window
+const uint32_t STALL_GRACE_MS    = 250;  // don't check stall until spinning this long
+
+// === Line sensors ===
+int lineValues[3];
+int whiteBaseline[3]       = {0, 0, 0};
+int lineSensorThreshold[3] = {0, 0, 0};
+
+// === State machine ===
+enum State
+{
+  Pausing,
+  Waiting,
+  OpenRam,       // from doc2: aggressive opening charge
+  Scanning,      // slow spin searching for opponent
+  Tracking,      // from doc2: proportional approach with sensor fusion
+  Ramming,       // from doc2: adaptive duration, steering correction
+  Backing,       // from doc3: long reverse, no borderDetection re-trigger
+  EscapeTurn,    // from doc3: wide sweep with mid-spin lock-on
+  Reposition,    // from doc3: drive inward after sweep before scanning
+};
+
+State    currentState     = Pausing;
+bool     justChangedState = false;
+uint32_t stateStartTime   = 0;
+
+int      scanDir          =  1;
+int      lastRamDiff      =  0;   // from doc2: steering memory during ram
+uint32_t ramDuration      =  0;   // from doc2: adaptive ram timeout
+uint32_t lostTargetTime   =  0;   // from doc3: hysteresis for Tracking
+uint32_t stallStartTime   =  0;   // stall detection: when spin stall began
+
+// === Forward declarations ===
+void     calibrateLineSensors();
+void     calibrateGyro();
+bool     borderDetection();
+bool     trackAndCenter(int &outCorrection, int &outFrontAvg);
+bool     isStalled();
+void     gyroResistPush(int baseSpeed);
+void     changeState(State newState);
+uint32_t timeInThisState();
+
+// =========================================================================
+void setup()
+{
+  lineSensors.initThreeSensors();
+  proxSensors.initThreeSensors();
+  Wire.begin();
+  imu.init();
+  imu.enableDefault();
+  calibrateLineSensors();
+  calibrateGyro();
+  changeState(Pausing);
+}
+
+// =========================================================================
+//  CALIBRATION (same in both — using doc2's compact version)
+// =========================================================================
+void calibrateLineSensors()
+{
+  display.clear();
+  display.print(F("On WHITE"));
+  display.gotoXY(0, 1);
+  display.print(F("press A"));
+  while (!buttonA.getSingleDebouncedPress()) {}
+
+  int32_t wTot[3] = {0, 0, 0};
+  for (int i = 0; i < 20; i++)
+  {
+    lineSensors.read(lineValues);
+    for (int s = 0; s < 3; s++) wTot[s] += lineValues[s];
+    delay(20);
+  }
+  int wSamp[3];
+  for (int s = 0; s < 3; s++) wSamp[s] = wTot[s] / 20;
+
+  display.clear();
+  display.print(F("W:"));
+  display.print(wSamp[0]);
+  display.print(F(" "));
+  display.print(wSamp[1]);
+  display.gotoXY(0, 1);
+  display.print(F("  "));
+  display.print(wSamp[2]);
+  delay(800);
+
+  display.clear();
+  display.print(F("On DARK"));
+  display.gotoXY(0, 1);
+  display.print(F("press A"));
+  while (!buttonA.getSingleDebouncedPress()) {}
+
+  int32_t dTot[3] = {0, 0, 0};
+  for (int i = 0; i < 20; i++)
+  {
+    lineSensors.read(lineValues);
+    for (int s = 0; s < 3; s++) dTot[s] += lineValues[s];
+    delay(20);
+  }
+  int dSamp[3];
+  for (int s = 0; s < 3; s++) dSamp[s] = dTot[s] / 20;
+
+  display.clear();
+  display.print(F("D:"));
+  display.print(dSamp[0]);
+  display.print(F(" "));
+  display.print(dSamp[1]);
+  display.gotoXY(0, 1);
+  display.print(F("  "));
+  display.print(dSamp[2]);
+  delay(800);
+
+  for (int s = 0; s < 3; s++)
+  {
+    whiteBaseline[s]       = wSamp[s];
+    lineSensorThreshold[s] = (wSamp[s] + dSamp[s]) / 2;
+  }
+
+  display.clear();
+  display.print(F("Thr:"));
+  display.print(lineSensorThreshold[0]);
+  display.print(F(" "));
+  display.print(lineSensorThreshold[1]);
+  display.gotoXY(0, 1);
+  display.print(F("    "));
+  display.print(lineSensorThreshold[2]);
+  display.print(F(" OK"));
+  delay(1200);
+}
+
+void calibrateGyro()
+{
+  display.clear();
+  display.print(F("GyroCal"));
+  int32_t total = 0;
+  for (int i = 0; i < 100; i++)
+  {
+    imu.read();
+    total += imu.g.z;
+    delay(10);
+  }
+  gyroOffsetZ = total / 100;
+  display.clear();
+  display.print(F("Ready"));
+  delay(400);
+}
+
+// =========================================================================
+//  SENSOR FUSION (from doc2) — uses all 4 prox sensors with weighted sum
+// =========================================================================
+bool trackAndCenter(int &outCorrection, int &outFrontAvg)
+{
+  proxSensors.read();
+  int sL = proxSensors.countsLeftWithLeftLeds();
+  int fL = proxSensors.countsFrontWithLeftLeds();
+  int fR = proxSensors.countsFrontWithRightLeds();
+  int sR = proxSensors.countsRightWithRightLeds();
+
+  int totalSignal = sL + fL + fR + sR;
+  if (totalSignal == 0)
+  {
+    outCorrection = 0;
+    outFrontAvg   = 0;
+    return false;
+  }
+
+  // Weighted: side sensors get 3x weight, front get 1x
+  int weightedSum = (sL * -3) + (fL * -1) + (fR * 1) + (sR * 3);
+  outCorrection = weightedSum * 35;
+  outFrontAvg   = (fL + fR) / 2;
+
+  // Update scan direction toward strongest side signal
+  if (sL > fL && sL > fR) scanDir = -1;
+  if (sR > fR && sR > fL) scanDir =  1;
+
+  return true;
+}
+
+// =========================================================================
+//  MAIN LOOP
+// =========================================================================
+void loop()
+{
+  bool buttonPress = buttonA.getSingleDebouncedPress();
+
+  // ----- PAUSING -----
+  if (currentState == Pausing)
+  {
+    motors.setSpeeds(0, 0);
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Press A"));
+    }
+    if (millis() % 1000 < 10)
+    {
+      display.gotoXY(0, 1);
+      display.print(readBatteryMillivolts());
+      display.print(F("mV"));
+    }
+    if (buttonPress) changeState(Waiting);
+  }
+
+  // ----- WAITING (5s countdown) -----
+  else if (currentState == Waiting)
+  {
+    motors.setSpeeds(0, 0);
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("WAIT"));
+      buzzer.playNote(NOTE_A(4), 50, 15);
+    }
+
+    uint32_t elapsed  = timeInThisState();
+    uint32_t timeLeft = waitTime - elapsed;
+    display.gotoXY(0, 1);
+    display.print(timeLeft / 1000);
+    display.print(F("."));
+    display.print((timeLeft % 1000) / 100);
+    display.print(F("s "));
+
+    // Pre-detect which side the opponent is on
+    proxSensors.read();
+    int sL = proxSensors.countsLeftWithLeftLeds();
+    int sR = proxSensors.countsRightWithRightLeds();
+    if (sL > 0 || sR > 0)
+      scanDir = (sL >= sR) ? -1 : 1;
+
+    if (elapsed >= waitTime)
+    {
+      buzzer.playNote(NOTE_A(5), 100, 15);
+      changeState(OpenRam);
+    }
+  }
+
+  // ----- OPEN RAM (from doc2: aggressive opening charge) -----
+  else if (currentState == OpenRam)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("OPEN!"));
+      ledRed(1);
+    }
+
+    if (borderDetection()) return;
+
+    // Full speed ahead — if we pick up the opponent, transition
+    int correction, frontAvg;
+    if (trackAndCenter(correction, frontAvg))
+    {
+      if (frontAvg >= PROX_COMMIT)
+      {
+        // Close enough to ram immediately
+        ramDuration = (uint32_t)max((int32_t)RAM_MIN_MS,
+                        (int32_t)RAM_MAX_MS - (int32_t)frontAvg * (int32_t)RAM_PER_UNIT_MS);
+        lastRamDiff = 0;
+        changeState(Ramming);
+        return;
+      }
+      // See them but not close — switch to proportional Tracking
+      changeState(Tracking);
+      return;
+    }
+
+    // Blind charge — no signal yet
+    motors.setSpeeds(rammingSpeed, rammingSpeed);
+
+    if (timeInThisState() >= openRamTime)
+      changeState(Scanning);
+  }
+
+  // ----- SCANNING (doc3 slow spin + doc2 sensor fusion detection) -----
+  else if (currentState == Scanning)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      stallStartTime = 0;
+      display.clear();
+      display.print(F("Scan"));
+    }
+
+    if (borderDetection()) return;
+
+    int correction, frontAvg;
+    if (trackAndCenter(correction, frontAvg))
+    {
+      // Any signal at all -> Tracking for proportional approach
+      stallStartTime = 0;
+      changeState(Tracking);
+      return;
+    }
+
+    // Spin to search
+    motors.setSpeeds(scanDir * turnSpeed, -scanDir * turnSpeed);
+
+    // Stall detection — only after grace period so robot reaches rotation speed
+    // Prevents false triggers during initial spin-up
+    if (timeInThisState() > STALL_GRACE_MS && isStalled())
+    {
+      if (stallStartTime == 0)
+        stallStartTime = millis();
+
+      // Confirmed stall — something is physically blocking the turn
+      if (millis() - stallStartTime > STALL_TIME_MS)
+      {
+        motors.setSpeeds(rammingSpeed, rammingSpeed);
+        ramDuration = RAM_MAX_MS;
+        lastRamDiff = 0;
+        changeState(Ramming);
+        return;
+      }
+    }
+    else
+    {
+      stallStartTime = 0;
+    }
+  }
+
+  // ----- TRACKING (from doc2: proportional approach with sensor fusion) -----
+  else if (currentState == Tracking)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("Track"));
+      ledGreen(1);
+      lostTargetTime = 0;
+    }
+
+    if (borderDetection()) return;
+
+    int correction, frontAvg;
+    if (!trackAndCenter(correction, frontAvg))
+    {
+      // Lost signal — but if we're stalled, opponent is pressed against us
+      if (isStalled())
+      {
+        ramDuration = RAM_MAX_MS;
+        lastRamDiff = 0;
+        changeState(Ramming);
+        return;
+      }
+
+      // Not stalled — coast forward briefly before giving up
+      if (lostTargetTime == 0)
+        lostTargetTime = millis();
+
+      if (millis() - lostTargetTime > 150)
+      {
+        changeState(Scanning);
+        return;
+      }
+      motors.setSpeeds(forwardSpeed, forwardSpeed);
+    }
+    else
+    {
+      lostTargetTime = 0;  // still see them
+
+      // Close enough to commit to full ram?
+      if (frontAvg >= PROX_COMMIT)
+      {
+        ramDuration = (uint32_t)max((int32_t)RAM_MIN_MS,
+                        (int32_t)RAM_MAX_MS - (int32_t)frontAvg * (int32_t)RAM_PER_UNIT_MS);
+        lastRamDiff = 0;
+        changeState(Ramming);
+        return;
+      }
+
+      // Proportional steering toward opponent
+      int absCorrection = abs(correction);
+      if (absCorrection > 150)
+      {
+        // Big offset — pure turn to face them
+        int dir = (correction > 0) ? 1 : -1;
+        motors.setSpeeds(dir * fastTurnSpeed, -dir * fastTurnSpeed);
+      }
+      else
+      {
+        // Small offset — drive forward with steering
+        motors.setSpeeds(
+          constrain(forwardSpeed - correction, -400, 400),
+          constrain(forwardSpeed + correction, -400, 400)
+        );
+        gyroResistPush(forwardSpeed);
+      }
+    }
+  }
+
+  // ----- RAMMING (from doc2: adaptive duration + steering correction) -----
+  else if (currentState == Ramming)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      lastRamDiff = 0;
+      display.clear();
+      display.print(F("RAM!"));
+      ledRed(1);
+    }
+
+    if (borderDetection()) return;
+
+    // Read prox and steer into opponent during ram
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+
+    if (fL > 0 || fR > 0)
+      lastRamDiff = fL - fR;  // remember last known direction
+
+    int correction = lastRamDiff * 25;
+    motors.setSpeeds(
+      constrain(rammingSpeed - correction, 0, 400),
+      constrain(rammingSpeed + correction, 0, 400)
+    );
+    gyroResistPush(rammingSpeed);
+
+    // Smart exit: don't quit ramming while still engaged
+    if (timeInThisState() > ramDuration)
+    {
+      bool stillSeeTarget = (fL > 0 || fR > 0);
+      bool blocked = isStalled();
+
+      if (stillSeeTarget || blocked)
+      {
+        // Still pushing something — extend the ram, but reset timer
+        // to prevent stateStartTime from overflowing the 3x cap check
+        if (timeInThisState() > RAM_MAX_MS * 2)
+        {
+          ramDuration = RAM_MAX_MS;
+          changeState(Ramming);  // restart fresh ram cycle
+        }
+        // else just keep going within current cycle
+      }
+      else
+        changeState(Scanning);
+    }
+  }
+
+  // ----- BACKING (from doc3: long fast reverse, no borderDetection) -----
+  else if (currentState == Backing)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("BACK!"));
+      ledYellow(1);
+    }
+
+    motors.setSpeeds(reverseSpeed, reverseSpeed);
+
+    if (timeInThisState() >= reverseTime)
+      changeState(EscapeTurn);
+
+    // NO borderDetection() here — prevents re-trigger loop at edge
+  }
+
+  // ----- ESCAPE TURN (from doc3: wide sweep with mid-spin lock-on) -----
+  else if (currentState == EscapeTurn)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("EscTurn"));
+    }
+
+    motors.setSpeeds(scanDir * fastTurnSpeed, -scanDir * fastTurnSpeed);
+
+    // Check for opponent mid-spin using sensor fusion
+    int correction, frontAvg;
+    if (trackAndCenter(correction, frontAvg) && timeInThisState() > 100)
+    {
+      changeState(Tracking);  // lock on immediately
+      return;
+    }
+
+    if (timeInThisState() >= escapeTurnTime)
+      changeState(Reposition);  // no target -> drive inward first
+
+    // Check if we're spinning into another edge
+    lineSensors.read(lineValues);
+    if ((lineValues[0] < lineSensorThreshold[0]) &&
+        (lineValues[2] < lineSensorThreshold[2]))
+    {
+      scanDir = -scanDir;
+      changeState(Backing);
+    }
+  }
+
+  // ----- REPOSITION (from doc3: drive inward before scanning) -----
+  else if (currentState == Reposition)
+  {
+    if (justChangedState)
+    {
+      justChangedState = false;
+      display.clear();
+      display.print(F("REPOS"));
+      ledGreen(1);
+    }
+
+    if (borderDetection()) return;
+
+    motors.setSpeeds(forwardSpeed, forwardSpeed);
+
+    // Lock on if we spot opponent while repositioning
+    int correction, frontAvg;
+    if (trackAndCenter(correction, frontAvg))
+    {
+      changeState(Tracking);
+      return;
+    }
+
+    if (timeInThisState() >= repositionTime)
+      changeState(Scanning);
+  }
+
+  else
+    changeState(Pausing);
+}
+
+// =========================================================================
+//  BORDER DETECTION (merged: doc3's structure + doc2's ramming exception)
+// =========================================================================
+bool borderDetection()
+{
+  lineSensors.read(lineValues);
+
+  bool bL = (lineValues[0] < lineSensorThreshold[0]);
+  bool bC = (lineValues[1] < lineSensorThreshold[1]);
+  bool bR = (lineValues[2] < lineSensorThreshold[2]);
+
+  if (!bL && !bC && !bR)
+    return false;
+
+  // During Backing/EscapeTurn — handled separately in those states
+  if (currentState == Backing || currentState == EscapeTurn)
+    return false;
+
+  // During Ramming with active contact — allow center-only hits to keep pushing
+  // (from doc2: don't abort a ram just because center sensor grazes the line)
+  if (currentState == Ramming)
+  {
+    proxSensors.read();
+    int fL = proxSensors.countsFrontWithLeftLeds();
+    int fR = proxSensors.countsFrontWithRightLeds();
+    bool activeContact = (fL > 0 || fR > 0 || timeInThisState() < 500);
+
+    if (activeContact && bC && !bL && !bR)
+    {
+      // Center-only border during active ram — escape turn instead of full back
+      scanDir = -scanDir;
+      changeState(EscapeTurn);
+      return true;
+    }
+    if (activeContact && !bL && !bR)
+      return false;  // pushing opponent near edge, keep going
+  }
+
+  // Standard border responses
+  if (bL && !bR) { scanDir =  1; changeState(Backing); return true; }
+  if (bR && !bL) { scanDir = -1; changeState(Backing); return true; }
+  if (bL && bR)  { scanDir = -scanDir; changeState(Backing); return true; }
+  if (bC)        { scanDir = -scanDir; changeState(Backing); return true; }
+
+  return false;
+}
+
+// =========================================================================
+//  STALL DETECTION — are we commanding movement but physically blocked?
+// =========================================================================
+bool isStalled()
+{
+  imu.read();
+  int32_t gyroZ = abs(imu.g.z - gyroOffsetZ);
+  return (gyroZ < STALL_GYRO_THRESH);
+}
+
+// =========================================================================
+//  GYRO RESIST PUSH (from doc3: parameterized baseSpeed)
+// =========================================================================
+void gyroResistPush(int baseSpeed)
+{
+  imu.read();
+  int32_t gyroZ = imu.g.z - gyroOffsetZ;
+
+  if (abs(gyroZ) > PUSH_RATE_THRESHOLD)
+  {
+    int correction = constrain((int)(gyroZ / 7), -150, 150);
+    int leftSpeed  = constrain(baseSpeed - correction, -400, 400);
+    int rightSpeed = constrain(baseSpeed + correction, -400, 400);
+    motors.setSpeeds(leftSpeed, rightSpeed);
+  }
+}
+
+uint32_t timeInThisState()
+{
+  return (uint32_t)(millis() - stateStartTime);
+}
+
+// No display.clear() here — prevents I2C bus stalls on rapid transitions
+void changeState(State newState)
+{
+  currentState     = newState;
+  justChangedState = true;
+  stateStartTime   = millis();
+  ledRed(0);
+  ledYellow(0);
+  ledGreen(0);
+}
