@@ -53,12 +53,13 @@ int opponentSide = 1;
 
 uint32_t stateStartTime;
 uint32_t roundStartTime;
+uint32_t lostTargetTime = 0;   // tracks when Driving last lost sight of opponent
 bool justChangedState;
 
 void calibrateLineSensors();
 void calibrateGyro();
 bool borderDetection();
-void gyroResistPush();
+void gyroResistPush(int baseSpeed);
 void changeState(uint8_t newState);
 uint32_t timeInThisState();
 
@@ -318,6 +319,7 @@ void loop()
       justChangedState = false;
       display.clear();
       display.print(F("Drive"));
+      lostTargetTime = 0;
     }
 
     proxSensors.read();
@@ -326,6 +328,8 @@ void loop()
 
     if (frontL >= 2 || frontR >= 2)
     {
+      lostTargetTime = 0;  // reset — we still see them
+
       if (frontL >= 4 && frontR >= 4)
       {
         changeState(Ramming);
@@ -338,11 +342,20 @@ void loop()
           constrain(forwardSpeed - speedDiff, -400, 400),
           constrain(forwardSpeed + speedDiff, -400, 400)
         );
-        gyroResistPush();
+        gyroResistPush(forwardSpeed);
       }
     }
     else
-      changeState(Scanning);
+    {
+      // Lost sight — keep driving forward briefly in case it's a bad read
+      if (lostTargetTime == 0)
+        lostTargetTime = millis();
+
+      if (millis() - lostTargetTime > 150)
+        changeState(Scanning);  // truly gone, start searching
+      else
+        motors.setSpeeds(forwardSpeed, forwardSpeed);  // coast forward
+    }
 
     borderDetection();
   }
@@ -358,7 +371,7 @@ void loop()
     }
 
     motors.setSpeeds(rammingSpeed, rammingSpeed);
-    gyroResistPush();
+    gyroResistPush(rammingSpeed);
 
     proxSensors.read();
     int frontL = proxSensors.countsFrontWithLeftLeds();
@@ -499,7 +512,7 @@ bool borderDetection()
   return false;
 }
 
-void gyroResistPush()
+void gyroResistPush(int baseSpeed)
 {
   imu.read();
   int32_t gyroZ = imu.g.z - gyroOffsetZ;
@@ -507,8 +520,8 @@ void gyroResistPush()
   if (abs(gyroZ) > PUSH_RATE_THRESHOLD)
   {
     int correction = constrain((int)(gyroZ / 7), -150, 150);
-    int leftSpeed  = constrain(forwardSpeed - correction, -400, 400);
-    int rightSpeed = constrain(forwardSpeed + correction, -400, 400);
+    int leftSpeed  = constrain(baseSpeed - correction, -400, 400);
+    int rightSpeed = constrain(baseSpeed + correction, -400, 400);
     motors.setSpeeds(leftSpeed, rightSpeed);
   }
 }
@@ -523,5 +536,4 @@ void changeState(uint8_t newState)
   currentState     = (State)newState;
   justChangedState = true;
   stateStartTime   = millis();
-  display.clear();
 }
